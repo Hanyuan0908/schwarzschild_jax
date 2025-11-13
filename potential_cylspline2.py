@@ -13,6 +13,232 @@ ArrayLike = Union[float, np.ndarray]
 # import jax.numpy as jnp
 # # import numpy as np
 
+class CubicSpline2D:
+    """
+    2D cubic spline interpolator for regular grids.
+    
+    This class mimics scipy.interpolate.RegularGridInterpolator with method='cubic'
+    for 2D data only. It uses separable bicubic spline interpolation.
+    
+    Parameters
+    ----------
+    points : tuple of 2 arrays
+        Grid points in each dimension. Each array must be strictly increasing.
+        points = (x_grid, y_grid)
+    values : 2D array
+        Data values at grid points. Shape must be (len(x_grid), len(y_grid))
+    bounds_error : bool, optional
+        If True, raises ValueError for out-of-bounds points. Default is True.
+    fill_value : float, optional
+        Value to return for out-of-bounds points if bounds_error=False.
+        Default is np.nan.
+    """
+    
+    def __init__(self, points, values, bounds_error=True, fill_value=np.nan):
+        if len(points) != 2:
+            raise ValueError("This implementation only supports 2D interpolation")
+        
+        self.grid = tuple(np.asarray(p, dtype=float) for p in points)
+        self.values = np.asarray(values, dtype=float)
+        self.bounds_error = bounds_error
+        self.fill_value = fill_value
+        
+        # Validate inputs
+        if self.values.shape != tuple(len(g) for g in self.grid):
+            raise ValueError(f"values shape {self.values.shape} doesn't match "
+                           f"grid shape {tuple(len(g) for g in self.grid)}")
+        
+        for i, g in enumerate(self.grid):
+            if len(g) < 2:
+                raise ValueError(f"Grid dimension {i} must have at least 2 points")
+            if not np.all(np.diff(g) > 0):
+                raise ValueError(f"Grid dimension {i} must be strictly increasing")
+        
+        # Precompute spline second derivatives
+        self._precompute_splines()
+    
+    def _precompute_splines(self):
+        """
+        Precompute second derivatives for cubic splines along each dimension.
+        """
+        nx, ny = self.values.shape
+        
+        # Compute second derivatives for splines along x (for each y)
+        self.M_x = np.zeros((nx, ny))
+        for j in range(ny):
+            self.M_x[:, j] = self._compute_second_derivatives(
+                self.grid[0], self.values[:, j]
+            )
+        
+        # Compute second derivatives for splines along y (for each x)
+        self.M_y = np.zeros((nx, ny))
+        for i in range(nx):
+            self.M_y[i, :] = self._compute_second_derivatives(
+                self.grid[1], self.values[i, :]
+            )
+    
+    def _compute_second_derivatives(self, x, y):
+        """
+        Compute second derivatives for cubic spline using not-a-knot boundary conditions.
+        
+        Parameters
+        ----------
+        x : array
+            Grid points (must be strictly increasing)
+        y : array
+            Function values at grid points
+            
+        Returns
+        -------
+        M : array
+            Second derivatives at grid points
+        """
+        n = len(x)
+        h = np.diff(x)
+        
+        if n == 2:
+            # Linear interpolation for 2 points
+            return np.zeros(2)
+        
+        # Build tridiagonal system
+        A = np.zeros((n, n))
+        b = np.zeros(n)
+        
+        # First equation: not-a-knot at left
+        if n == 3:
+            A[0, 0] = 1.0
+            b[0] = 0.0
+        else:
+            A[0, 0] = h[1]
+            A[0, 1] = -(h[0] + h[1])
+            A[0, 2] = h[0]
+            b[0] = 0.0
+        
+        # Interior equations
+        for i in range(1, n-1):
+            A[i, i-1] = h[i-1]
+            A[i, i] = 2.0 * (h[i-1] + h[i])
+            A[i, i+1] = h[i]
+            b[i] = 6.0 * ((y[i+1] - y[i]) / h[i] - (y[i] - y[i-1]) / h[i-1])
+        
+        # Last equation: not-a-knot at right
+        if n == 3:
+            A[n-1, n-1] = 1.0
+            b[n-1] = 0.0
+        else:
+            A[n-1, n-3] = h[n-2]
+            A[n-1, n-2] = -(h[n-3] + h[n-2])
+            A[n-1, n-1] = h[n-3]
+            b[n-1] = 0.0
+        
+        # Solve the system
+        M = np.linalg.solve(A, b)
+        
+        return M
+    
+    def __call__(self, xi, method=None):
+        """
+        Evaluate interpolator at given points using separable bicubic interpolation.
+        
+        This vectorized version processes all points at once for better performance.
+        
+        Parameters
+        ----------
+        xi : array-like
+            Points at which to interpolate. Shape (..., 2)
+            Last dimension corresponds to (x, y) coordinates.
+            
+        Returns
+        -------
+        result : array
+            Interpolated values
+        """
+        xi = np.asarray(xi, dtype=float)
+        
+        # Handle shape
+        if xi.shape[-1] != 2:
+            raise ValueError("Last dimension of xi must be 2 for 2D interpolation")
+        
+        original_shape = xi.shape[:-1]
+        xi = xi.reshape(-1, 2)
+        n_points = len(xi)
+        
+        x_pts = xi[:, 0]
+        y_pts = xi[:, 1]
+        
+        # Check bounds
+        out_of_bounds = np.zeros(n_points, dtype=bool)
+        out_of_bounds |= (x_pts < self.grid[0][0]) | (x_pts > self.grid[0][-1])
+        out_of_bounds |= (y_pts < self.grid[1][0]) | (y_pts > self.grid[1][-1])
+        
+        if self.bounds_error and np.any(out_of_bounds):
+            raise ValueError("Some points are out of bounds")
+        
+        # Clamp to boundaries
+        x_pts = np.clip(x_pts, self.grid[0][0], self.grid[0][-1])
+        y_pts = np.clip(y_pts, self.grid[1][0], self.grid[1][-1])
+        
+        # Find x intervals for all points at once
+        i_x = np.searchsorted(self.grid[0], x_pts) - 1
+        i_x = np.clip(i_x, 0, len(self.grid[0]) - 2)
+        
+        # Find y intervals for all points at once
+        i_y = np.searchsorted(self.grid[1], y_pts) - 1
+        i_y = np.clip(i_y, 0, len(self.grid[1]) - 2)
+        
+        # Vectorized computation of normalized coordinates
+        h_x = self.grid[0][i_x + 1] - self.grid[0][i_x]
+        t_x = (x_pts - self.grid[0][i_x]) / h_x
+        
+        h_y = self.grid[1][i_y + 1] - self.grid[1][i_y]
+        t_y = (y_pts - self.grid[1][i_y]) / h_y
+        
+        # Get corner values for all points
+        z00 = self.values[i_x, i_y]
+        z10 = self.values[i_x + 1, i_y]
+        z01 = self.values[i_x, i_y + 1]
+        z11 = self.values[i_x + 1, i_y + 1]
+        
+        # Get second derivatives at corners
+        Mx00 = self.M_x[i_x, i_y]
+        Mx10 = self.M_x[i_x + 1, i_y]
+        Mx01 = self.M_x[i_x, i_y + 1]
+        Mx11 = self.M_x[i_x + 1, i_y + 1]
+        
+        # Interpolate along x at y_j and y_{j+1} using vectorized operations
+        # At y = y_j (bottom edge)
+        f_x0 = (1 - t_x) * z00 + t_x * z10 + \
+               ((1 - t_x)**3 - (1 - t_x)) * Mx00 * h_x**2 / 6.0 + \
+               (t_x**3 - t_x) * Mx10 * h_x**2 / 6.0
+        
+        # At y = y_{j+1} (top edge)
+        f_x1 = (1 - t_x) * z01 + t_x * z11 + \
+               ((1 - t_x)**3 - (1 - t_x)) * Mx01 * h_x**2 / 6.0 + \
+               (t_x**3 - t_x) * Mx11 * h_x**2 / 6.0
+        
+        # Get second derivatives in y-direction at the x-interpolated points
+        # We need M values for the y-spline through (f_x0, f_x1)
+        # For a simple 2-point case, we can use the precomputed M_y values
+        # and interpolate them along x as well
+        
+        My00 = self.M_y[i_x, i_y]
+        My10 = self.M_y[i_x + 1, i_y]
+        My01 = self.M_y[i_x, i_y + 1]
+        My11 = self.M_y[i_x + 1, i_y + 1]
+        
+        # Interpolate M_y along x at both y values
+        My_x0 = (1 - t_x) * My00 + t_x * My10
+        My_x1 = (1 - t_x) * My01 + t_x * My11
+        
+        # Now interpolate along y using the interpolated values and M's
+        result = (1 - t_y) * f_x0 + t_y * f_x1 + \
+                 ((1 - t_y)**3 - (1 - t_y)) * My_x0 * h_y**2 / 6.0 + \
+                 (t_y**3 - t_y) * My_x1 * h_y**2 / 6.0
+        
+        # Apply fill value for out of bounds points
+        result[out_of_bounds] = self.fill_value
+        
+        return result.reshape(original_shape)
 
 # -------------------- coordinate helpers --------------------
 
@@ -232,10 +458,12 @@ class CylSpline:
             raise ValueError("rho_xyz returned non-finite values in a basic probe.")
 
         # storage
-        self._rho_m_grid: Dict[int, Array] = {}
-        self._rho_m_interp: Dict[int, RegularGridInterpolator] = {}
-        self._Phi_m_grid: Dict[int, Array] = {}
-        self._Phi_m_interp: Dict[int, RegularGridInterpolator] = {}
+        self._rho_m_grid = {}
+        self._rho_m_real_interp = {}
+        self._rho_m_imag_interp = {}
+        self._Phi_m_grid = {}
+        self._Phi_m_real_interp = {}
+        self._Phi_m_imag_interp = {}
 
     # --------- adapters ---------
     def rho_Rzphi(self, R: Array, z: Array, phi: Array) -> Array:
@@ -263,15 +491,23 @@ class CylSpline:
 
         for m in range(0, self.mmax + 1):
             self._rho_m_grid[m] = rho_m[m]
-            self._rho_m_interp[m] = RegularGridInterpolator(
-                (self.R, self.Z_nonneg), rho_m[m], method="linear",
-                bounds_error=False, fill_value=None
+            # self._rho_m_interp[m] = RegularGridInterpolator(
+            #     (self.R, self.Z_nonneg), rho_m[m], method="linear",
+            #     bounds_error=False, fill_value=None
+            # )
+            self._rho_m_real_interp[m] = CubicSpline2D(
+                (self.R, self.Z_nonneg), rho_m[m].real,
+                bounds_error=False, fill_value=0.
+            )
+            self._rho_m_imag_interp[m] = CubicSpline2D(
+                (self.R, self.Z_nonneg), rho_m[m].imag,
+                bounds_error=False, fill_value=0.
             )
 
 
     def rho_m_eval(self, m: int, R: ArrayLike, z: ArrayLike) -> Array:
         if m < 0 or m > self.mmax: raise ValueError(f"m∈[0,{self.mmax}]")
-        if m not in self._rho_m_interp: raise RuntimeError("compute_rho_m() first.")
+        if m not in self._rho_m_real_interp: raise RuntimeError("compute_rho_m() first.")
         Rb = np.asarray(R, float)
         zb = np.abs(np.asarray(z, float))
         shape = Rb.shape
@@ -279,7 +515,7 @@ class CylSpline:
         pts = np.column_stack((Rb.ravel(), zb.ravel()))
         # print('hallo')
         # print(np.broadcast_arrays(Rb, zb))
-        return self._rho_m_interp[m](pts).reshape(shape)
+        return self._rho_m_real_interp[m](pts).reshape(shape) + 1j * self._rho_m_imag_interp[m](pts).reshape(shape)
 
     # --------- kernel Ξ_m via AGAMA LegendreQ ---------
     def kernel_Xi_m(self, m: int, R: float, z: float, Rp: ArrayLike, zp: ArrayLike) -> np.ndarray:
@@ -418,8 +654,16 @@ class CylSpline:
                     Phi[i,j] = -self.G * 2.0 * I
                 if progress: print(f"[fixed] m={m} R[{i+1}/{self.NR}]")
             self._Phi_m_grid[m]=Phi
-            self._Phi_m_interp[m]=RegularGridInterpolator(
-                (self.R, self.Z_nonneg), Phi, method="linear", bounds_error=False, fill_value=None
+            # self._Phi_m_interp[m]=RegularGridInterpolator(
+            #     (self.R, self.Z_nonneg), Phi, method="linear", bounds_error=False, fill_value=None
+            # )
+            self._Phi_m_real_interp[m]=CubicSpline2D(
+                (self.R, self.Z_nonneg), Phi.real,
+                bounds_error=False, fill_value=0.
+            )
+            self._Phi_m_imag_interp[m]=CubicSpline2D(
+                (self.R, self.Z_nonneg), Phi.imag,
+                bounds_error=False, fill_value=0.
             )
         return {"nx":nx,"nz":nz,"N_total":nx*nz,"rule":rule}
 
@@ -625,7 +869,7 @@ class CylSpline:
             Φ_m(R0,z0) = -G * ∬_{[0,1]^2}  ρ_m(R',z') * [Ξ_m(R0,z0|R',+z') + Ξ_m(R0,z0|R',-z')]
                                     * (2π R') * J(xi,eta)  dxi deta
         """
-        if not self._rho_m_interp:
+        if not self._rho_m_real_interp:
             raise RuntimeError("Run compute_rho_m() first.")
 
         # --- choose Simpson node counts (odd ≥3) from N_int if not provided ---
@@ -692,9 +936,17 @@ class CylSpline:
 
             # store grid + interpolator
             self._Phi_m_grid[m] = Phi
-            self._Phi_m_interp[m] = RegularGridInterpolator(
-                (self.R, self.Z_nonneg), Phi, method="linear",
-                bounds_error=False, fill_value=None
+            # self._Phi_m_interp[m] = RegularGridInterpolator(
+            #     (self.R, self.Z_nonneg), Phi, method="linear",
+            #     bounds_error=False, fill_value=None
+            # )
+            self._Phi_m_real_interp[m] = CubicSpline2D(
+                (self.R, self.Z_nonneg), Phi.real,
+                bounds_error=False, fill_value=0.
+            )
+            self._Phi_m_imag_interp[m] = CubicSpline2D(
+                (self.R, self.Z_nonneg), Phi.imag,
+                bounds_error=False, fill_value=0.
             )
 
         return {
@@ -707,13 +959,13 @@ class CylSpline:
 
     # --------- evaluate Φ from Φ_m interpolators ---------
     def phi_m_eval(self, m: int, R: ArrayLike, z: ArrayLike) -> Array:
-        if m not in self._Phi_m_interp:
+        if m not in self._Phi_m_real_interp:
             raise RuntimeError("compute_phi_m_grid_*() and build of Φ_m interpolators required first.")
         Rb = np.asarray(R, float); zb = np.abs(np.asarray(z, float))
         # pts = np.stack(np.broadcast_arrays(Rb, zb), axis=-1).reshape(-1, 2)
         shape = Rb.shape
         pts = np.column_stack((Rb.ravel(), zb.ravel()))
-        return self._Phi_m_interp[m](pts).reshape(shape)
+        return self._Phi_m_real_interp[m](pts).reshape(shape) + 1j * self._Phi_m_imag_interp[m](pts).reshape(shape)
 
     def potential(self, R: ArrayLike, z: ArrayLike, phi: ArrayLike) -> Array:
         Rb = np.asarray(R, float); zb = np.asarray(z, float); ph = np.asarray(phi, float)
@@ -735,7 +987,7 @@ class CylSpline:
         Reconstruct ρ(R,z,φ) from the complex Fourier moments ρ_m(R,z) that were
         built by compute_rho_m(). Uses even symmetry in z via |z|.
         """
-        if not self._rho_m_interp:
+        if not self._rho_m_real_interp:
             raise RuntimeError("compute_rho_m() must be called before density().")
 
         Rb = np.asarray(R, float)
