@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 import numpy as np
 
-
+G = 4.3e-6
 EPSILON = 1e-12
 
 # -------------------- AGAMA-style Legendre Q (Padé + asymptotic) --------------------
