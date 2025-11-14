@@ -7,19 +7,22 @@ from scipy.special import gamma, hyp2f1
 Array = np.ndarray
 ArrayLike = Union[float, np.ndarray]
 
+import jax
+import jax.numpy as jnp
+from functools import partial
+from constants import EPSILON
 # -------------------- coordinate helpers --------------------
-
-def cartesian_to_cylindrical(x: Array, y: Array, z: Array) -> Tuple[Array, Array, Array]:
-    x = np.asarray(x, float); y = np.asarray(y, float); z = np.asarray(z, float)
-    R  = np.sqrt(x*x + y*y)
-    phi = np.arctan2(y, x)
-    phi = np.where(phi < 0.0, phi + 2*np.pi, phi)
-    phi = np.where(R == 0.0, 0.0, phi)  # define φ=0 on axis
+@jax.jit
+def cartesian_to_cylindrical(x,y,z):
+    R   = jnp.sqrt(x*x + y*y)
+    phi = jnp.arctan2(y, x)
+    phi = jnp.where(phi < 0.0, phi + 2*jnp.pi, phi)
+    phi = jnp.where(R == 0.0, 0.0, phi)  # define φ=0 on axis
     return R, phi, z
 
-def cylindrical_to_cartesian(R: Array, phi: Array, z: Array) -> Tuple[Array, Array, Array]:
-    R = np.asarray(R, float); phi = np.asarray(phi, float); z = np.asarray(z, float)
-    x = R * np.cos(phi); y = R * np.sin(phi)
+@jax.jit
+def cylindrical_to_cartesian(R, phi, z):
+    x = R * jnp.cos(phi); y = R * jnp.sin(phi)
     return x, y, z
 
 # -------------------- AGAMA-style Legendre Q (Padé + asymptotic) --------------------
@@ -118,7 +121,7 @@ Q_PREFACTOR = np.array([
 X_THRESHOLD1 = np.array([0.94,0.956,0.968,0.98,0.98,0.983,0.987,0.989,0.99,0.992,0.992,0.9928,0.993])
 X_THRESHOLD0 = np.array([0.72,0.72,0.80,0.80,0.83,0.86,0.85,0.88,0.88,0.88,0.885,0.90,0.91])
 
-def _hypergeom_m(m: int, x: float, want_deriv: bool = False):
+def _hypergeom_m(m, x):
     if x < X_THRESHOLD1[m]:
         A = HYPERGEOM_0[m] if x < X_THRESHOLD0[m] else HYPERGEOM_I[m]
         xA8 = x + A[8]
@@ -126,27 +129,16 @@ def _hypergeom_m(m: int, x: float, want_deriv: bool = False):
         xA4 = x + A[4] + A[5] / xA6
         xA2 = x + A[2] + A[3] / xA4
         F = A[0] + A[1] / xA2
-        if want_deriv:
-            dFdx = -A[1] / (xA2**2) * (1 - A[3] / (xA4**2) * (1 - A[5] / (xA6**2) * (1 - A[7] / (xA8**2))))
-        else:
-            dFdx = 0.0
-        return F, dFdx
+        return F
     else:
         A = HYPERGEOM_1[m]
         y = 1.0 - x
         y2 = y*y
-        z = np.log(max(y, np.finfo(float).tiny))
+        z = jnp.log(jnp.maximum(y, EPSILON))
         F = (A[0] + A[1]*z +
              (A[2] + A[3]*z) * y +
              (A[4] + A[5]*z + (A[6] + A[7]*z) * y + (A[8] + A[9]*z) * y2) * y2)
-        if want_deriv:
-            dFdx = (-A[1]/y
-                    - (A[2] + A[3] + A[3]*z)
-                    - (2*A[4] + A[5] + 2*A[5]*z) * y
-                    - (3*A[6] + A[7] + 3*A[7]*z + (4*A[8] + A[9] + 4*A[9]*z) * y) * y2)
-        else:
-            dFdx = 0.0
-        return F, dFdx
+        return F
 
 def legendreQ(n: float, x: ArrayLike) -> np.ndarray:
     xa = np.asarray(x, float)
@@ -156,10 +148,11 @@ def legendreQ(n: float, x: ArrayLike) -> np.ndarray:
     is_halfint = (abs(m - (n + 0.5)) < 1e-12) and (0 <= m <= MMAX_HYPERGEOM)
     it = np.nditer(xa, flags=['multi_index'])
     while not it.finished:
+        print(it.multi_index)
         xv = float(it[0])
         if is_halfint:
             pref = Q_PREFACTOR[m] / np.sqrt(xv) / (xv**m)
-            F, _ = _hypergeom_m(m, 1.0/(xv*xv), want_deriv=False)
+            F = _hypergeom_m(m, 1.0/(xv*xv))
             out[it.multi_index] = pref * F
         else:
             C = (2.0 * xv) ** (-1.0 - n) * np.sqrt(np.pi) * gamma(n + 1.0) / gamma(n + 1.5)
@@ -168,12 +161,11 @@ def legendreQ(n: float, x: ArrayLike) -> np.ndarray:
     return out
 
 # -------------------- CylSpline --------------------
-
 class CylSpline:
     """
     CylSpline (z-even): build z≥0 (includes z=0), project ρ→ρ_m, compute Φ_m via 2D integration,
     fit linear 2D interpolators for both ρ_m and Φ_m, and evaluate Φ(R,φ,z).
-    """
+    """ 
 
     def __init__(
         self,
@@ -309,69 +301,6 @@ class CylSpline:
         w = np.ones(n); w[1:-1:2] = 4.0; w[2:-1:2] = 2.0
         return w
 
-    # # ===================== ADAPTIVE integrator (with eval budget) =====================
-    # def _adaptive_simpson_2d(self, f, ax, bx, ay, by, tol=1e-4, max_evals=10_000):
-    #     cache = {}; ncall = 0
-    #     def val(x,y):
-    #         nonlocal ncall
-    #         k=(float(x),float(y)); v=cache.get(k)
-    #         if v is None: v=f(x,y); cache[k]=v; ncall+=1
-    #         return v
-    #     def Srect(x0,x1,y0,y1):
-    #         xm=0.5*(x0+x1); ym=0.5*(y0+y1)
-    #         f00=val(x0,y0); f10=val(xm,y0); f20=val(x1,y0)
-    #         f01=val(x0,ym); f11=val(xm,ym); f21=val(x1,ym)
-    #         f02=val(x0,y1); f12=val(xm,y1); f22=val(x1,y1)
-    #         hx=0.5*(x1-x0); hy=0.5*(y1-y0)
-    #         return (hx*hy)/9.0*((f00+f20+f02+f22)+4*(f10+f01+f21+f12)+16*f11)
-    #     def rec(x0,x1,y0,y1,S,tol_loc):
-    #         xm=0.5*(x0+x1); ym=0.5*(y0+y1)
-    #         S1=Srect(x0,xm,y0,ym); S2=Srect(xm,x1,y0,ym)
-    #         S3=Srect(x0,xm,ym,y1); S4=Srect(xm,x1,ym,y1)
-    #         Ssum=S1+S2+S3+S4; err=np.abs(Ssum-S)/15.0
-    #         if np.all(err<=tol_loc) or ncall>=max_evals: return Ssum, err
-    #         tol_child=tol_loc/4.0
-    #         I1,e1=rec(x0,xm,y0,ym,S1,tol_child)
-    #         if ncall>=max_evals: return I1+S2+S3+S4, e1
-    #         I2,e2=rec(xm,x1,y0,ym,S2,tol_child)
-    #         if ncall>=max_evals: return I1+I2+S3+S4, e2
-    #         I3,e3=rec(x0,xm,ym,y1,S3,tol_child)
-    #         if ncall>=max_evals: return I1+I2+I3+S4, e3
-    #         I4,e4=rec(xm,x1,ym,y1,S4,tol_child)
-    #         return I1+I2+I3+I4, max(e1,e2,e3,e4)
-    #     S0=Srect(ax,bx,ay,by)
-    #     I,err=rec(ax,bx,ay,by,S0,tol)
-    #     return I, ncall, (ncall>=max_evals)
-
-    # def compute_phi_m_grid_adaptive(
-    #     self, *, tol: float = 1e-4, max_evals: int = 10_000,
-    #     R_int_max: Optional[float] = None, Z_int_max: Optional[float] = None,
-    #     m_list: Optional[List[int]] = None, progress: bool = False
-    # ):
-    #     if not self._rho_m_interp: raise RuntimeError("compute_rho_m() first.")
-    #     Rint=float(R_int_max if R_int_max is not None else self.Rmax)
-    #     Zint=float(Z_int_max if Z_int_max is not None else self.Zmax)
-    #     m_list = list(range(self.mmax+1)) if m_list is None else list(m_list)
-    #     self._Phi_m_grid={}; self._Phi_m_interp={}
-    #     diagnostics={}
-    #     for m in m_list:
-    #         Phi=np.zeros((self.NR, self.Z_nonneg.size), dtype=complex)
-    #         for i,R in enumerate(self.R):
-    #             for j,z in enumerate(self.Z_nonneg):
-    #                 f=self._integrand_m(m,R,z)
-    #                 fre=lambda x,y: np.real(f(x,y))
-    #                 fim=lambda x,y: np.imag(f(x,y))
-    #                 Ire,n1,_=self._adaptive_simpson_2d(fre,0.0,Rint,0.0,Zint,tol=tol/2,max_evals=max_evals)
-    #                 Iim,n2,_=self._adaptive_simpson_2d(fim,0.0,Rint,0.0,Zint,tol=tol/2,max_evals=max(0,max_evals-n1))
-    #                 Phi[i,j] = -self.G * 2.0 * (Ire + 1j*Iim)  # even-in-z ⇒ ×2
-    #                 diagnostics[(m,i,j)]={"evals":n1+n2}
-    #             if progress: print(f"[adaptive] m={m} R[{i+1}/{self.NR}]")
-    #         self._Phi_m_grid[m]=Phi
-    #         self._Phi_m_interp[m]=RegularGridInterpolator(
-    #             (self.R, self.Z_nonneg), Phi, method="cubic", bounds_error=False, fill_value=None
-    #         )
-    #     return diagnostics
-
     # # ===================== FIXED integrator (uniform tensor grid, N_int≈10k) =====================
     def compute_phi_m_grid_fixed(
         self, *, N_int: int = 10_000,
@@ -486,117 +415,6 @@ class CylSpline:
         dz_deta = LZ * (zmin_map + zp)
         J = dR_dxi * dz_deta
         return Rp, zp, J
-    
-    # def compute_phi_m_grid_fixed_mapped(
-    #     self,
-    #     *,
-    #     N_int: int = 10_000,
-    #     n_xi: Optional[int] = None,
-    #     n_eta: Optional[int] = None,
-    #     m_list: Optional[List[int]] = None,
-    #     progress: bool = False,
-    # ):
-    #     """
-    #     Compute Φ_m(R,z) on the (R, z≥0) grid using a tensor Simpson rule over (xi,eta)∈[0,1]^2,
-    #     with AGAMA-style log mapping and Jacobian.
-
-    #     Integral (half-space build, even in z):
-    #         Φ_m(R0,z0) = -G * 2 * ∬_{[0,1]^2}  [ ρ_m(R',z') * Ξ_m(m; R0,z0 | R',z') * (2π R') ] * J(xi,eta)  dxi deta
-    #     where:
-    #         (R', z', J) = _xieta_to_Rz_jacobian(xi, eta)
-    #         J = (∂R/∂xi) * (∂z/∂eta)  (the 2π R' factor is put into the integrand explicitly)
-
-    #     Parameters
-    #     ----------
-    #     N_int : total target number of samples (rough budget). Used if n_xi/n_eta not given.
-    #     n_xi, n_eta : explicit odd counts for Simpson along xi and eta. If given, they override N_int.
-    #                 Must be odd and ≥ 3.
-    #     m_list : which m to compute (default: 0..mmax).
-    #     progress : print per-R line progress.
-
-    #     Returns
-    #     -------
-    #     dict with the chosen (n_xi, n_eta) and total nodes.
-    #     """
-    #     if not self._rho_m_interp:
-    #         raise RuntimeError("Run compute_rho_m() first.")
-
-    #     # Choose Simpson node counts (odd >=3)
-    #     if (n_xi is None) or (n_eta is None):
-    #         base = max(9, int(np.sqrt(max(16, N_int))))
-    #         if base % 2 == 0:
-    #             base += 1
-    #         n_xi = base if n_xi is None else int(n_xi)
-    #         n_eta = base if n_eta is None else int(n_eta)
-    #     if n_xi < 3 or n_xi % 2 == 0:
-    #         raise ValueError("Simpson along xi needs odd n_xi >= 3.")
-    #     if n_eta < 3 or n_eta % 2 == 0:
-    #         raise ValueError("Simpson along eta needs odd n_eta >= 3.")
-
-    #     # Simpson weights on [0,1]
-    #     def simpson_weights(n: int) -> np.ndarray:
-    #         w = np.ones(n)
-    #         w[1:-1:2] = 4.0
-    #         w[2:-1:2] = 2.0
-    #         w *= (1.0 / (n - 1)) / 3.0   # h = 1/(n-1), scale by h/3
-    #         return w
-
-    #     wxi  = simpson_weights(n_xi)
-    #     weta = simpson_weights(n_eta)
-
-    #     # Tensor nodes
-    #     xi  = np.linspace(0.0, 1.0, n_xi)
-    #     eta = np.linspace(0.0, 1.0, n_eta)
-    #     XI, ETA = np.meshgrid(xi, eta, indexing="ij")      # (n_xi, n_eta)
-
-    #     # Map to physical (R', z') and get Jacobian part (no 2πR' here)
-    #     Rp, zp, Jmap = self._xieta_to_Rz_jacobian(XI, ETA) # (n_xi, n_eta) each
-
-    #     # Precompute the combined 2D Simpson weights
-    #     W2D = (wxi[:, None]) * (weta[None, :])             # (n_xi, n_eta)
-
-    #     # Set which m to compute
-    #     m_list = list(range(self.mmax + 1)) if m_list is None else list(m_list)
-
-    #     self._Phi_m_grid = {}
-    #     self._Phi_m_interp = {}
-
-    #     for m in tqdm(m_list, total = len(m_list)):
-    #         Phi = np.zeros((self.NR, self.Z_nonneg.size), dtype=complex)
-
-    #         # Precompute density ρ_m at all (R',z') nodes ONCE per m (vectorized)
-    #         rho_grid = self.rho_m_eval(m, Rp, zp)          # (n_xi, n_eta), complex
-
-    #         for i, R0 in enumerate(self.R):
-    #             for j, z0 in enumerate(self.Z_nonneg):
-    #                 # Kernel at all nodes for this (R0, z0)
-    #                 Xi_kernel = self.kernel_Xi_m(m, R0, z0, Rp, zp)   # (n_xi, n_eta), real
-
-    #                 # Build integrand: ρ_m * Ξ_m * (2π R') * Jmap
-    #                 F = rho_grid * Xi_kernel * (2.0 * np.pi) * Rp * Jmap  # complex
-
-    #                 # Simpson tensor product on [0,1]^2
-    #                 I = np.sum(W2D * F)
-
-    #                 # Even symmetry in z' (upper half only)
-    #                 Phi[i, j] = -self.G * 2.0 * I
-
-    #             if progress:
-    #                 print(f"[mapped simpson] m={m}  R[{i+1}/{self.NR}]")
-
-    #         # store grid + interpolator
-    #         self._Phi_m_grid[m] = Phi
-    #         self._Phi_m_interp[m] = RegularGridInterpolator(
-    #             (self.R, self.Z_nonneg), Phi, method="cubic",
-    #             bounds_error=False, fill_value=None
-    #         )
-
-    #     return {
-    #         "n_xi": n_xi,
-    #         "n_eta": n_eta,
-    #         "total_nodes": n_xi * n_eta,
-    #         "rule": "simpson([0,1]^2) with log-mapping",
-    #     }
 
     def compute_phi_m_grid_fixed_mapped(
         self,
@@ -664,7 +482,7 @@ class CylSpline:
             # Precompute density ρ_m at all (R',z') nodes ONCE per m (even in z)
             rho_grid = self.rho_m_eval(m, Rp, zp)                         # (n_xi, n_eta), complex
 
-            for i, R0 in enumerate(self.R):
+            for i, R0 in tqdm(enumerate(self.R), leave=True):
                 for j, z0 in enumerate(self.Z_nonneg):
                     # kernel from +z' and −z' (sum, not average)
                     Xi_plus  = self.kernel_Xi_m(m, R0, z0, Rp,  zp)       # real

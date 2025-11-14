@@ -1,11 +1,10 @@
-import agama
-agama.setUnits(mass=1, length=1, velocity=1)
+# import agama
+# agama.setUnits(mass=1, length=1, velocity=1)
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 
 from potential_cylspline import *
-
 
 def mn_phi_cyl(R, z, M, a, b, G):
     """
@@ -67,8 +66,8 @@ if __name__ == "__main__":
 
     def rho_input(x):
         return rho_gt(x[:,0], x[:,1], x[:,2])
-    pot_agama = agama.Potential(type='Cylspline', density=rho_input, gridSizeR=50, gridSizez=30, rmin=1e-3, rmax=30,zmin=1e-3, zmax=20,
-                        symmetry = 'none', mmax=7)
+    # pot_agama = agama.Potential(type='Cylspline', density=rho_input, gridSizeR=50, gridSizez=30, rmin=1e-3, rmax=30,zmin=1e-3, zmax=20,
+    #                     symmetry = 'none', mmax=7)
 
     # --- Projected surface density maps: face-on (z=0) and side-on (y=0) ---
 
@@ -166,7 +165,7 @@ if __name__ == "__main__":
         ax.set_ylabel('z')
 
     plt.tight_layout()
-    fig.savefig("//Users/hanyuan/Desktop/PhD_projects/Schwarchild_bar/cylspline_MNdisc_surface_density_maps.png", dpi=150)
+    fig.savefig("cylspline_MNdisc_surface_density_maps.png", dpi=150)
     # plt.show()
 
     Potential_agama_faceon = np.zeros_like(X)
@@ -255,7 +254,7 @@ if __name__ == "__main__":
         ax.set_ylabel('z')
 
     plt.tight_layout()
-    fig.savefig("//Users/hanyuan/Desktop/PhD_projects/Schwarchild_bar/cylspline_MNdisc_projected_potentials_maps.png", dpi=150)
+    fig.savefig("cylspline_MNdisc_projected_potentials_maps.png", dpi=150)
     plt.show()
 
     plt.figure()
